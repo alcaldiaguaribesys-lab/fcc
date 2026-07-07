@@ -24,7 +24,7 @@ if __name__ == "__main__":
     import uvicorn
 
     from cli.process_registry import kill_all_best_effort
-    from config.settings import get_settings()
+    from config.settings import get_settings
 
     settings = get_settings()
     try:
