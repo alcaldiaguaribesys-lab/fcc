@@ -5,6 +5,15 @@ Minimal entry point that builds the ASGI app via :func:`api.app.create_app`.
 Run with: uv run uvicorn server:app --host 0.0.0.0 --port 8082 --timeout-graceful-shutdown 5
 """
 
+import sys
+import os
+print("DEBUG: Current working directory:", os.getcwd())
+print("DEBUG: sys.path:", sys.path)
+print("DEBUG: Directory contents:", os.listdir('.'))
+print("DEBUG: Looking for api directory:", os.path.isdir('api'))
+if os.path.isdir('api'):
+    print("DEBUG: api directory contents:", os.listdir('api'))
+
 from api.app import create_app, create_asgi_app
 
 app = create_asgi_app()
@@ -15,7 +24,7 @@ if __name__ == "__main__":
     import uvicorn
 
     from cli.process_registry import kill_all_best_effort
-    from config.settings import get_settings
+    from config.settings import get_settings()
 
     settings = get_settings()
     try:
