@@ -1,0 +1,7 @@
+# 1. Abrir PowerShell en directorio del proyecto (free-claude-code-main)
+# Levantar servidor API (dejar pestaña abierta)
+uv run server.py
+
+# 2. Abrir NUEVA pestaña PowerShell en mismo directorio
+# Iniciar consola Claude
+uv run python -m cli.entrypoints claude
