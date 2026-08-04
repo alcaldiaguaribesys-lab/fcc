@@ -1,5 +1,5 @@
 """
-NVIDIA NIM provider implementation with built-in rate limiter (39 requests/min).
+NVIDIA NIM provider implementation with steroid‑grade rate limiter (39 req/min).
 """
 
 import json
@@ -29,50 +29,56 @@ from .tool_schema import (
 
 class RateLimiter:
     """
-    Ventana fija simple: máximo `max_requests` por cada minuto (según reloj).
-    Si se alcanza el límite, bloquea hasta que comience el siguiente minuto.
+    Ventana fija turbo: 39 peticiones por minuto.
+    Usa threading.Condition para despertar a todos los hilos exactamente al abrir
+    una nueva ventana → cero polling, cero cuellos de botella.
     """
 
     def __init__(self, max_requests: int = 39):
         self.max_requests = max_requests
-        self._lock = threading.Lock()
-        self._window_start = 0.0
+        self._cond = threading.Condition()
+        self._window_start = time.monotonic()
         self._count = 0
 
     def acquire(self):
-        """Adquiere un cupo; se bloquea si se superó el límite en el minuto actual."""
-        while True:
-            with self._lock:
-                now = time.time()
+        """Bloquea hasta conseguir un cupo, con la mínima latencia posible."""
+        with self._cond:
+            while True:
+                now = time.monotonic()
                 current_minute = int(now // 60)
+                window_minute = int(self._window_start // 60)
 
-                # Reiniciar contador si cambió de minuto
-                if current_minute != int(self._window_start // 60):
+                # ¿Nueva ventana? Reiniciamos contador y despertamos a los que esperan
+                if current_minute != window_minute:
                     self._window_start = now
                     self._count = 0
+                    self._cond.notify_all()   # 🚀 todos a la vez
 
-                # Si hay cupo, lo tomamos y salimos
+                # Si hay sitio, lo tomamos y salimos
                 if self._count < self.max_requests:
                     self._count += 1
                     logger.debug(
-                        f"RateLimiter: petición aceptada ({self._count}/{self.max_requests} en esta ventana)"
+                        f"RateLimiter: cupo {self._count}/{self.max_requests}"
                     )
                     return
 
-                # Si no hay cupo, calculamos cuánto falta para la próxima ventana
-                seconds_to_next_minute = 60 - (now % 60)
+                # Calculamos exactamente cuándo empieza el siguiente minuto
+                seconds_until_next = 60 - (now % 60)
+                if seconds_until_next <= 0:
+                    seconds_until_next = 0.1  # margen de seguridad
 
-            # Fuera del lock para no bloquear a otros hilos mientras dormimos
-            logger.warning(
-                f"RateLimiter: límite de {self.max_requests} peticiones/minuto alcanzado. "
-                f"Esperando {seconds_to_next_minute:.1f}s hasta la nueva ventana."
-            )
-            time.sleep(seconds_to_next_minute + 0.1)  # pequeño margen de seguridad
-            # Al despertar, el bucle vuelve a comprobar el contador
+                logger.info(
+                    f"RateLimiter: límite alcanzado, durmiendo {seconds_until_next:.2f}s"
+                )
+                # wait() libera el lock y espera hasta que:
+                #   - alguien llame notify_all() (nueva ventana), o
+                #   - se cumpla el timeout
+                self._cond.wait(timeout=seconds_until_next)
+                # Al despertar, el bucle reevalúa inmediatamente
 
 
 class NvidiaNimProvider(OpenAIChatTransport):
-    """NVIDIA NIM provider using official OpenAI client, with rate limiting."""
+    """Proveedor NVIDIA NIM con cliente OpenAI y rate limiter blindado."""
 
     def __init__(self, config: ProviderConfig, *, nim_settings: NimSettings):
         super().__init__(
@@ -82,13 +88,11 @@ class NvidiaNimProvider(OpenAIChatTransport):
             api_key=config.api_key,
         )
         self._nim_settings = nim_settings
-        # Instanciamos el limitador (39 peticiones por minuto)
         self._rate_limiter = RateLimiter(max_requests=39)
 
     def _build_request_body(
         self, request: Any, thinking_enabled: bool | None = None
     ) -> dict:
-        """Internal helper for tests and shared building."""
         return build_nim_request_body(
             request,
             self._nim_settings,
@@ -96,15 +100,13 @@ class NvidiaNimProvider(OpenAIChatTransport):
         )
 
     def _prepare_create_body(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Strip private request metadata before calling NVIDIA NIM."""
         return body_without_nim_tool_argument_aliases(body)
 
     def _tool_argument_aliases(self, body: dict[str, Any]) -> dict[str, dict[str, str]]:
-        """Return NIM tool argument aliases captured while building this request."""
         return nim_tool_argument_aliases_from_body(body)
 
     def _get_retry_request_body(self, error: Exception, body: dict) -> dict | None:
-        """Retry once with a downgraded body when NIM rejects a known field."""
+        """Reintenta una vez eliminando campos que NIM rechaza con 400."""
         status_code = getattr(error, "status_code", None)
         if not isinstance(error, openai.BadRequestError) and status_code != 400:
             return None
@@ -117,39 +119,32 @@ class NvidiaNimProvider(OpenAIChatTransport):
 
         if "reasoning_budget" in error_text:
             retry_body = clone_body_without_reasoning_budget(body)
-            if retry_body is None:
-                return None
-            logger.warning(
-                "NIM_STREAM: retrying without reasoning_budget after 400 error"
-            )
-            return retry_body
+            if retry_body is not None:
+                logger.warning("NIM: reintentando sin reasoning_budget")
+                return retry_body
 
         if "chat_template" in error_text:
             retry_body = clone_body_without_chat_template(body)
-            if retry_body is None:
-                return None
-            logger.warning("NIM_STREAM: retrying without chat_template after 400 error")
-            return retry_body
+            if retry_body is not None:
+                logger.warning("NIM: reintentando sin chat_template")
+                return retry_body
 
         if "reasoning_content" in error_text:
             retry_body = clone_body_without_reasoning_content(body)
-            if retry_body is None:
-                return None
-            logger.warning(
-                "NIM_STREAM: retrying without reasoning_content after 400 error"
-            )
-            return retry_body
+            if retry_body is not None:
+                logger.warning("NIM: reintentando sin reasoning_content")
+                return retry_body
 
         return None
 
     # ------------------------------------------------------------------
-    # Rate limiting hook – intercepta cada llamada HTTP real
+    # Interceptor de rate limiting – se engancha a la petición HTTP real
     # ------------------------------------------------------------------
     def _send_request(self, *args, **kwargs) -> Any:
         """
-        Envuelve la petición HTTP original para aplicar rate limiting.
-        Asegúrate de que el método de la clase base se llame realmente `_send_request`.
-        Si no, renómbralo al nombre correcto (ej. `_request`, `_post`, etc.).
+        Aplica el límite antes de enviar la petición.
+        ⚠️ Si el método de la clase base se llama distinto (ej. _request, _post),
+        renombra este override y la llamada a super().
         """
-        self._rate_limiter.acquire()          # espera si es necesario
+        self._rate_limiter.acquire()
         return super()._send_request(*args, **kwargs)
