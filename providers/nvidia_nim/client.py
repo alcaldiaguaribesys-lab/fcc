@@ -41,32 +41,34 @@ class RateLimiter:
 
     def acquire(self):
         """Adquiere un cupo; se bloquea si se superó el límite en el minuto actual."""
-        with self._lock:
-            now = time.time()
-            current_minute = int(now // 60)
+        while True:
+            with self._lock:
+                now = time.time()
+                current_minute = int(now // 60)
 
-            # Reiniciar contador si cambió de minuto
-            if current_minute != int(self._window_start // 60):
-                self._window_start = now
-                self._count = 0
+                # Reiniciar contador si cambió de minuto
+                if current_minute != int(self._window_start // 60):
+                    self._window_start = now
+                    self._count = 0
 
-            # Si ya llegamos al límite, esperar hasta el siguiente minuto
-            if self._count >= self.max_requests:
+                # Si hay cupo, lo tomamos y salimos
+                if self._count < self.max_requests:
+                    self._count += 1
+                    logger.debug(
+                        f"RateLimiter: petición aceptada ({self._count}/{self.max_requests} en esta ventana)"
+                    )
+                    return
+
+                # Si no hay cupo, calculamos cuánto falta para la próxima ventana
                 seconds_to_next_minute = 60 - (now % 60)
-                logger.warning(
-                    f"RateLimiter: límite de {self.max_requests} peticiones/minuto alcanzado. "
-                    f"Esperando {seconds_to_next_minute:.1f}s hasta la nueva ventana."
-                )
-                # Fuera del lock mientras dormimos para no bloquear otros hilos
-                time.sleep(seconds_to_next_minute + 0.1)  # pequeño margen de seguridad
-                # Volver a intentar (recursivo) con la nueva ventana
-                return self.acquire()
 
-            # Cupo disponible
-            self._count += 1
-            logger.debug(
-                f"RateLimiter: petición aceptada ({self._count}/{self.max_requests} en esta ventana)"
+            # Fuera del lock para no bloquear a otros hilos mientras dormimos
+            logger.warning(
+                f"RateLimiter: límite de {self.max_requests} peticiones/minuto alcanzado. "
+                f"Esperando {seconds_to_next_minute:.1f}s hasta la nueva ventana."
             )
+            time.sleep(seconds_to_next_minute + 0.1)  # pequeño margen de seguridad
+            # Al despertar, el bucle vuelve a comprobar el contador
 
 
 class NvidiaNimProvider(OpenAIChatTransport):
@@ -146,8 +148,8 @@ class NvidiaNimProvider(OpenAIChatTransport):
     def _send_request(self, *args, **kwargs) -> Any:
         """
         Envuelve la petición HTTP original para aplicar rate limiting.
-        IMPORTANTE: Si OpenAIChatTransport usa otro nombre de método (ej. _request,
-        _post, _make_request), cambia el nombre de este override.
+        Asegúrate de que el método de la clase base se llame realmente `_send_request`.
+        Si no, renómbralo al nombre correcto (ej. `_request`, `_post`, etc.).
         """
         self._rate_limiter.acquire()          # espera si es necesario
         return super()._send_request(*args, **kwargs)
