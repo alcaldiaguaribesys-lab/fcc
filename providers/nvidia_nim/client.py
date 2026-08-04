@@ -1,77 +1,153 @@
-"""NVIDIA NIM provider client con limitador de tasa a 39 RPM para free-claude-code."""
+"""
+NVIDIA NIM provider implementation with built-in rate limiter (39 requests/min).
+"""
 
-import asyncio
-import logging
+import json
+import threading
 import time
-from collections import deque
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any
 
-logger = logging.getLogger(__name__)
+import openai
+from loguru import logger
+
+from config.nim import NimSettings
+from providers.base import ProviderConfig
+from providers.defaults import NVIDIA_NIM_DEFAULT_BASE
+from providers.transports.openai_chat import OpenAIChatTransport
+
+from .request_options import build_nim_request_body
+from .retry import (
+    clone_body_without_chat_template,
+    clone_body_without_reasoning_budget,
+    clone_body_without_reasoning_content,
+)
+from .tool_schema import (
+    body_without_nim_tool_argument_aliases,
+    nim_tool_argument_aliases_from_body,
+)
 
 
-class NIMRateLimiter:
-    """Limitador de ventana deslizante para NVIDIA NIM (Máximo 39 RPM)."""
+class RateLimiter:
+    """
+    Ventana fija simple: máximo `max_requests` por cada minuto (según reloj).
+    Si se alcanza el límite, bloquea hasta que comience el siguiente minuto.
+    """
 
-    def __init__(self, max_rpm: int = 39, window_seconds: float = 60.0):
-        self.max_rpm = max_rpm
-        self.window = window_seconds
-        self.timestamps = deque()
-        self._lock = asyncio.Lock()
+    def __init__(self, max_requests: int = 39):
+        self.max_requests = max_requests
+        self._lock = threading.Lock()
+        self._window_start = 0.0
+        self._count = 0
 
-    async def acquire(self) -> None:
-        async with self._lock:
+    def acquire(self):
+        """Adquiere un cupo; se bloquea si se superó el límite en el minuto actual."""
+        with self._lock:
             now = time.time()
+            current_minute = int(now // 60)
 
-            # Eliminar registros anteriores a los últimos 60 segundos
-            while self.timestamps and self.timestamps[0] <= now - self.window:
-                self.timestamps.popleft()
+            # Reiniciar contador si cambió de minuto
+            if current_minute != int(self._window_start // 60):
+                self._window_start = now
+                self._count = 0
 
-            # Si se alcanzaron las 39 peticiones en el último minuto
-            if len(self.timestamps) >= self.max_rpm:
-                sleep_duration = self.window - (now - self.timestamps[0]) + 0.1
-                if sleep_duration > 0:
-                    logger.info(
-                        f"[NIM RateLimiter] Alcanzado el límite de {self.max_rpm} RPM. "
-                        f"Pausando {sleep_duration:.2f} segundos..."
-                    )
-                    await asyncio.sleep(sleep_duration)
+            # Si ya llegamos al límite, esperar hasta el siguiente minuto
+            if self._count >= self.max_requests:
+                seconds_to_next_minute = 60 - (now % 60)
+                logger.warning(
+                    f"RateLimiter: límite de {self.max_requests} peticiones/minuto alcanzado. "
+                    f"Esperando {seconds_to_next_minute:.1f}s hasta la nueva ventana."
+                )
+                # Fuera del lock mientras dormimos para no bloquear otros hilos
+                time.sleep(seconds_to_next_minute + 0.1)  # pequeño margen de seguridad
+                # Volver a intentar (recursivo) con la nueva ventana
+                return self.acquire()
 
-                # Limpiar marcas de tiempo tras la pausa
-                now = time.time()
-                while self.timestamps and self.timestamps[0] <= now - self.window:
-                    self.timestamps.popleft()
-
-            self.timestamps.append(time.time())
-
-
-# Instancia compartida global en el servidor
-nim_limiter = NIMRateLimiter(max_rpm=39)
+            # Cupo disponible
+            self._count += 1
+            logger.debug(
+                f"RateLimiter: petición aceptada ({self._count}/{self.max_requests} en esta ventana)"
+            )
 
 
-class NvidiaNimClient:
-    """Cliente para interaccionar con la API de NVIDIA NIM regulado a 39 RPM."""
+class NvidiaNimProvider(OpenAIChatTransport):
+    """NVIDIA NIM provider using official OpenAI client, with rate limiting."""
 
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, **kwargs: Any):
-        self.api_key = api_key
-        self.base_url = base_url or "https://integrate.api.nvidia.com/v1"
-        self.extra_options = kwargs
+    def __init__(self, config: ProviderConfig, *, nim_settings: NimSettings):
+        super().__init__(
+            config,
+            provider_name="NIM",
+            base_url=config.base_url or NVIDIA_NIM_DEFAULT_BASE,
+            api_key=config.api_key,
+        )
+        self._nim_settings = nim_settings
+        # Instanciamos el limitador (39 peticiones por minuto)
+        self._rate_limiter = RateLimiter(max_requests=39)
 
-    async def _before_request(self) -> None:
-        """Aplica la pausa automática antes de llamar a la API de NIM."""
-        await nim_limiter.acquire()
+    def _build_request_body(
+        self, request: Any, thinking_enabled: bool | None = None
+    ) -> dict:
+        """Internal helper for tests and shared building."""
+        return build_nim_request_body(
+            request,
+            self._nim_settings,
+            thinking_enabled=self._is_thinking_enabled(request, thinking_enabled),
+        )
 
-    async def create_chat_completion(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Envía peticiones normales (non-streaming) aplicando el rate limit."""
-        await self._before_request()
-        
-        # Aquí se realiza la llamada HTTP a NIM
-        # (Asegúrate de incluir tu lógica existente de cliente httpx/aiohttp)
-        return {}
+    def _prepare_create_body(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Strip private request metadata before calling NVIDIA NIM."""
+        return body_without_nim_tool_argument_aliases(body)
 
-    async def stream_chat_completion(self, payload: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
-        """Envía peticiones en streaming aplicando el rate limit antes del inicio."""
-        await self._before_request()
+    def _tool_argument_aliases(self, body: dict[str, Any]) -> dict[str, dict[str, str]]:
+        """Return NIM tool argument aliases captured while building this request."""
+        return nim_tool_argument_aliases_from_body(body)
 
-        # Generador SSE existente
-        if False:
-            yield {}
+    def _get_retry_request_body(self, error: Exception, body: dict) -> dict | None:
+        """Retry once with a downgraded body when NIM rejects a known field."""
+        status_code = getattr(error, "status_code", None)
+        if not isinstance(error, openai.BadRequestError) and status_code != 400:
+            return None
+
+        error_text = str(error)
+        error_body = getattr(error, "body", None)
+        if error_body is not None:
+            error_text = f"{error_text} {json.dumps(error_body, default=str)}"
+        error_text = error_text.lower()
+
+        if "reasoning_budget" in error_text:
+            retry_body = clone_body_without_reasoning_budget(body)
+            if retry_body is None:
+                return None
+            logger.warning(
+                "NIM_STREAM: retrying without reasoning_budget after 400 error"
+            )
+            return retry_body
+
+        if "chat_template" in error_text:
+            retry_body = clone_body_without_chat_template(body)
+            if retry_body is None:
+                return None
+            logger.warning("NIM_STREAM: retrying without chat_template after 400 error")
+            return retry_body
+
+        if "reasoning_content" in error_text:
+            retry_body = clone_body_without_reasoning_content(body)
+            if retry_body is None:
+                return None
+            logger.warning(
+                "NIM_STREAM: retrying without reasoning_content after 400 error"
+            )
+            return retry_body
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Rate limiting hook – intercepta cada llamada HTTP real
+    # ------------------------------------------------------------------
+    def _send_request(self, *args, **kwargs) -> Any:
+        """
+        Envuelve la petición HTTP original para aplicar rate limiting.
+        IMPORTANTE: Si OpenAIChatTransport usa otro nombre de método (ej. _request,
+        _post, _make_request), cambia el nombre de este override.
+        """
+        self._rate_limiter.acquire()          # espera si es necesario
+        return super()._send_request(*args, **kwargs)
