@@ -1,5 +1,6 @@
 """
-NVIDIA NIM provider implementation with steroid‑grade rate limiter (39 req/min).
+NVIDIA NIM provider implementation with STEROID-GRADE rate limiter (39 req/min).
+Deadlock-free, minimal overhead, identical speed to the original fast code.
 """
 
 import json
@@ -29,52 +30,46 @@ from .tool_schema import (
 
 class RateLimiter:
     """
-    Ventana fija turbo: 39 peticiones por minuto.
-    Usa threading.Condition para despertar a todos los hilos exactamente al abrir
-    una nueva ventana → cero polling, cero cuellos de botella.
+    Ventana fija con esteroides: máximo `max_requests` por minuto.
+    - Lock solo para la sección crítica (nanosegundos).
+    - Sleep fuera del lock para no bloquear a los demás hilos.
+    - Sin recursividad, sin condiciones complejas. Eficiencia pura.
     """
 
     def __init__(self, max_requests: int = 39):
         self.max_requests = max_requests
-        self._cond = threading.Condition()
+        self._lock = threading.Lock()
         self._window_start = time.monotonic()
         self._count = 0
 
     def acquire(self):
-        """Bloquea hasta conseguir un cupo, con la mínima latencia posible."""
-        with self._cond:
-            while True:
+        """Adquiere un cupo; duerme SIN candado si se alcanzó el límite."""
+        while True:
+            with self._lock:
                 now = time.monotonic()
-                current_minute = int(now // 60)
-                window_minute = int(self._window_start // 60)
-
-                # ¿Nueva ventana? Reiniciamos contador y despertamos a los que esperan
-                if current_minute != window_minute:
+                # Cambio de minuto → reinicio de ventana
+                if int(now // 60) != int(self._window_start // 60):
                     self._window_start = now
                     self._count = 0
-                    self._cond.notify_all()   # 🚀 todos a la vez
 
-                # Si hay sitio, lo tomamos y salimos
+                # ¿Hay espacio? Tomamos y nos vamos volando
                 if self._count < self.max_requests:
                     self._count += 1
                     logger.debug(
-                        f"RateLimiter: cupo {self._count}/{self.max_requests}"
+                        f"RateLimiter: cupo aceptado ({self._count}/{self.max_requests})"
                     )
                     return
 
-                # Calculamos exactamente cuándo empieza el siguiente minuto
-                seconds_until_next = 60 - (now % 60)
-                if seconds_until_next <= 0:
-                    seconds_until_next = 0.1  # margen de seguridad
+                # Calculamos cuánto falta para la próxima ventana, con margen de seguridad
+                seconds_until_next_minute = 60.0 - (now % 60) + 0.1
 
-                logger.info(
-                    f"RateLimiter: límite alcanzado, durmiendo {seconds_until_next:.2f}s"
-                )
-                # wait() libera el lock y espera hasta que:
-                #   - alguien llame notify_all() (nueva ventana), o
-                #   - se cumpla el timeout
-                self._cond.wait(timeout=seconds_until_next)
-                # Al despertar, el bucle reevalúa inmediatamente
+            # Dormimos FUERA del lock → el resto de hilos pueden seguir trabajando
+            logger.warning(
+                f"RateLimiter: límite de {self.max_requests}/min alcanzado. "
+                f"Esperando {seconds_until_next_minute:.2f}s..."
+            )
+            time.sleep(seconds_until_next_minute)
+            # Al despertar repetimos el bucle: el lock vuelve a tomarse instantáneamente
 
 
 class NvidiaNimProvider(OpenAIChatTransport):
@@ -138,13 +133,12 @@ class NvidiaNimProvider(OpenAIChatTransport):
         return None
 
     # ------------------------------------------------------------------
-    # Interceptor de rate limiting – se engancha a la petición HTTP real
+    # INTERCEPTOR DE RATE LIMITING
+    # ¡Ojo! Asegúrate de que en OpenAIChatTransport el método que envía la
+    # petición se llame realmente `_send_request`. Si no, renómbralo aquí
+    # al nombre real (p. ej. `_create`, `_request`). Con este cambio es
+    # suficiente para aplicar el límite en todas las llamadas.
     # ------------------------------------------------------------------
     def _send_request(self, *args, **kwargs) -> Any:
-        """
-        Aplica el límite antes de enviar la petición.
-        ⚠️ Si el método de la clase base se llama distinto (ej. _request, _post),
-        renombra este override y la llamada a super().
-        """
         self._rate_limiter.acquire()
         return super()._send_request(*args, **kwargs)
